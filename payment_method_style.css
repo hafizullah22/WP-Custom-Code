@@ -1,1 +1,77 @@
+/* ======================================================
+   Payment Method Show as Button in Checkout Page
+   ====================================================== */
+
+/* Remove default background */
+.woocommerce-checkout #payment {
+    background: transparent;
+}
+
+/* Remove bullets */
+.woocommerce-checkout #payment ul.payment_methods {
+    padding-left: 0;
+    margin: 0;
+}
+
+/* Hide default radio buttons */
+.woocommerce-checkout #payment ul.payment_methods input[type="radio"] {
+    display: none !important;
+}
+
+/* Payment method card */
+.woocommerce-checkout #payment ul.payment_methods li.wc_payment_method {
+    border: 1.5px solid #d9d9d9;
+    border-radius: 8px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+    background: #ffffff;
+    cursor: pointer;
+    transition: all 0.25s ease;
+}
+
+/* Hover effect */
+.woocommerce-checkout #payment ul.payment_methods li.wc_payment_method:hover {
+    border-color: #1a73e8;
+}
+
+/* Selected payment method */
+.woocommerce-checkout #payment ul.payment_methods li.wc_payment_method.selected {
+    border-color: #1a73e8;
+    background: #f5f9ff;
+}
+
+/* Payment label (FORCE TEXT + ICON) */
+.woocommerce-checkout #payment ul.payment_methods li label {
+    display: flex !important;
+    align-items: center;
+    gap: 12px;
+    font-size: 15px !important;
+    font-weight: 600;
+    color: #111 !important;
+    cursor: pointer;
+    white-space: normal !important;
+    text-indent: 0 !important;
+}
+
+/* Prevent gateways hiding text */
+.woocommerce-checkout #payment ul.payment_methods li label * {
+    visibility: visible !important;
+    opacity: 1 !important;
+    font-size: inherit !important;
+}
+
+/* Payment icons */
+.woocommerce-checkout #payment ul.payment_methods li img {
+    max-height: 28px;
+    width: auto;
+}
+
+/* Payment description (Shopify style) */
+.woocommerce-checkout #payment div.payment_box {
+    margin-top: 12px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+}
 
