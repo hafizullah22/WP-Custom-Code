@@ -1,5 +1,3 @@
-if ( ! defined( 'ABSPATH' ) ) exit;
-
 // -----------------------------------------------------
 // 1. HIDE DEFAULT DROPDOWN AND SINGLE VARIATION PRICE
 // -----------------------------------------------------
