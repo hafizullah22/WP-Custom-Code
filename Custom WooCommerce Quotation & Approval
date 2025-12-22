@@ -1,0 +1,624 @@
+// ===========================================================
+// Handle Quotation Submission + Customer Creation + Password Link
+// ===========================================================
+add_action('template_redirect', function () {
+
+    if ( ! isset($_POST['submit_quotation']) ) return;
+
+    // -------------------------
+    // Security
+    // -------------------------
+    if (
+        ! isset($_POST['_quotation_nonce']) ||
+        ! wp_verify_nonce($_POST['_quotation_nonce'], 'submit_quotation_action')
+    ) {
+        wp_die('Security verification failed.');
+    }
+
+    if ( ! function_exists('WC') || WC()->cart->is_empty() ) {
+        wp_die('Your cart is empty.');
+    }
+
+    // -------------------------
+    // Sanitize Inputs
+    // -------------------------
+    $first_name  = sanitize_text_field($_POST['first_name'] ?? '');
+    $last_name   = sanitize_text_field($_POST['last_name'] ?? '');
+    $email       = sanitize_email($_POST['customer_email'] ?? '');
+    $phone       = sanitize_text_field($_POST['billing_phone'] ?? '');
+
+    $location    = sanitize_text_field($_POST['event_location'] ?? '');
+    $event_date  = sanitize_text_field($_POST['event_date'] ?? '');
+    $event_time  = sanitize_text_field($_POST['event_time'] ?? '');
+    $guest_count = absint($_POST['guest_count'] ?? 0);
+    $details     = sanitize_textarea_field($_POST['event_details'] ?? '');
+
+    // ===================================================
+    // CUSTOMER CREATION / ATTACHMENT
+    // ===================================================
+    $customer_id     = 0;
+    $is_new_customer = false;
+
+    if ( is_user_logged_in() ) {
+
+        $customer_id = get_current_user_id();
+
+    } else {
+
+        $existing_user = get_user_by('email', $email);
+
+        if ( $existing_user ) {
+
+            $customer_id = $existing_user->ID;
+
+        } else {
+
+            // Create new customer
+            $password    = wp_generate_password(20, true);
+            $customer_id = wp_create_user($email, $password, $email);
+
+            if ( is_wp_error($customer_id) ) {
+                wp_die($customer_id->get_error_message());
+            }
+
+            $is_new_customer = true;
+
+            // Set role
+            $user = new WP_User($customer_id);
+            $user->set_role('customer');
+
+            // Profile
+            wp_update_user([
+                'ID'         => $customer_id,
+                'first_name' => $first_name,
+                'last_name'  => $last_name,
+            ]);
+
+            // Billing meta
+            update_user_meta($customer_id, 'billing_first_name', $first_name);
+            update_user_meta($customer_id, 'billing_last_name', $last_name);
+            update_user_meta($customer_id, 'billing_email', $email);
+            update_user_meta($customer_id, 'billing_phone', $phone);
+
+            // Auto login
+            wp_set_current_user($customer_id);
+            wp_set_auth_cookie($customer_id);
+        }
+    }
+
+    // ===================================================
+// SEND PASSWORD SETUP LINK (NEW CUSTOMERS ONLY)
+// ===================================================
+if ( $is_new_customer && $customer_id ) {
+
+    add_action('shutdown', function () use ($customer_id, $first_name) {
+
+        $user = get_user_by('id', $customer_id);
+        if ( ! $user ) return;
+
+        $site_name = get_bloginfo('name'); // Get site name
+        $reset_key = get_password_reset_key($user);
+        $reset_url = wp_login_url() .
+            "?action=rp&key={$reset_key}&login=" . rawurlencode($user->user_login);
+
+        $message  = "Hello {$first_name},\n\n";
+        $message .= "Your quotation has been successfully submitted on {$site_name}.\n\n";
+        $message .= "To access your account and track your quotation, please set your password using the link below:\n\n";
+        $message .= "{$reset_url}\n\n";
+        $message .= "You will be able to complete payment once your quotation is approved.\n\n";
+        $message .= "Thank you,\n";
+        $message .= "{$site_name} Team";
+
+        wp_mail(
+            $user->user_email,
+            "Quotation Submitted – Set Your {$site_name} Account Password",
+            $message
+        );
+    });
+}
+
+    // ===================================================
+    // CREATE QUOTATION ORDER (UNCHANGED)
+    // ===================================================
+    $order = wc_create_order();
+
+    if ( $customer_id ) {
+        $order->set_customer_id($customer_id);
+    }
+
+    $order->set_billing_first_name($first_name);
+    $order->set_billing_last_name($last_name);
+    $order->set_billing_email($email);
+    $order->set_billing_phone($phone);
+
+    foreach ( WC()->cart->get_cart() as $cart_item ) {
+        $order->add_product($cart_item['data'], $cart_item['quantity']);
+    }
+
+    $order_id = $order->get_id();
+    $order->update_meta_data('_is_quotation', 'yes');
+    $order->save();
+
+    update_post_meta($order_id, '_event_location', $location);
+    update_post_meta($order_id, '_event_date', $event_date);
+    update_post_meta($order_id, '_event_time', $event_time);
+    update_post_meta($order_id, '_guest_count', $guest_count);
+    update_post_meta($order_id, '_event_details', $details);
+
+    $order->calculate_totals();
+    $order->update_status('pending', 'Quotation submitted. Awaiting admin approval.');
+
+    // Clear cart
+    WC()->cart->empty_cart(true);
+    WC()->session->destroy_session();
+
+    // Redirect
+    wp_safe_redirect(
+        add_query_arg('order_id', $order_id, site_url('/quotation-received/'))
+    );
+    exit;
+});
+
+
+
+// ===========================================================
+// 2️⃣ Quotation Page Shortcode
+// ===========================================================
+add_shortcode('quotation_page', function() {
+
+    if ( ! function_exists('WC') || ! WC()->cart ) {
+        return '<p>WooCommerce is not available.</p>';
+    }
+
+    ob_start();
+
+    $current_user = wp_get_current_user();
+    $prefill_first_name = is_user_logged_in() ? esc_attr($current_user->first_name) : '';
+    $prefill_last_name  = is_user_logged_in() ? esc_attr($current_user->last_name) : '';
+    $prefill_email      = is_user_logged_in() ? esc_attr($current_user->user_email) : '';
+	$prefill_phone     = is_user_logged_in() ? esc_attr($current_user->user_phone) : '';
+
+    if ( WC()->cart->is_empty() ) {
+        echo '<p style="color:white; font-weight:bold;">Your cart is empty. Add Items from Rental Page</p>';
+    } else {
+        ?>
+      <form method="post" class="quotation-form" style="
+    max-width:1000px; 
+    margin:40px auto; 
+    padding:30px; 
+    background:#002D28; 
+    border:2px solid #285151; 
+    border-radius:20px; 
+    box-shadow:0 6px 15px rgba(0,0,0,0.08);
+    font-family:Arial, sans-serif;
+">
+    <?php wp_nonce_field('submit_quotation_action', '_quotation_nonce'); ?>
+
+    
+
+    <!-- Customer Info Section -->
+    <fieldset style="border:none; margin-bottom:25px;">
+        <legend style="font-weight:600; font-size:18px; margin-bottom:15px; color:#F26A2E;">Contact Information</legend>
+
+        <!-- First + Last Name -->
+        <div style="display:flex; gap:20px; flex-wrap:wrap; margin-bottom:15px;">
+            <div style="flex:1; min-width:250px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">First Name</label>
+                <input type="text" name="first_name" value="<?php echo $prefill_first_name; ?>" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151">
+            </div>
+            <div style="flex:1; min-width:250px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Last Name</label>
+                <input type="text" name="last_name" value="<?php echo $prefill_last_name; ?>" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151">
+            </div>
+        </div>
+
+        <!-- Email + Phone -->
+        <div style="display:flex; gap:20px; flex-wrap:wrap; margin-bottom:15px;">
+            <div style="flex:1; min-width:250px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Email</label>
+                <input type="email" name="customer_email" value="<?php echo $prefill_email; ?>" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151">
+            </div>
+            <div style="flex:1; min-width:250px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Phone</label>
+                <input type="text" name="billing_phone" value="<?php echo $prefill_phone; ?>" style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151">
+            </div>
+        </div>
+    </fieldset>
+
+    <!-- Event Info Section -->
+    <fieldset style="border:none; margin-bottom:25px;">
+        <legend style="font-weight:600; font-size:18px; margin-bottom:15px; color:#F26A2E;">Event Information</legend>
+
+        <!-- Event Location -->
+        <div style="margin-bottom:15px;">
+            <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Event Location</label>
+            <input type="text" name="event_location" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151">
+        </div>
+
+        <!-- Date + Time + Guest Count -->
+        <div style="display:flex; gap:20px; flex-wrap:wrap; margin-bottom:15px;">
+            <div style="flex:1; min-width:200px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Event Date</label>
+                <input type="date" name="event_date" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151"">
+            </div>
+            <div style="flex:1; min-width:200px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Event Time</label>
+                <input type="time" name="event_time" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151" >
+            </div>
+            <div style="flex:1; min-width:150px;">
+                <label style="display:block; font-weight:600; margin-bottom:5px; color:#FFFFFF;">Number of Guests</label>
+                <input type="number" name="guest_count" min="1" required style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151">
+            </div>
+        </div>
+
+        <!-- Notes -->
+        <div style="margin-bottom:15px;">
+            <label style="display:block; font-weight:600; margin-bottom:5px;color:#FFFFFF;">Additional Notes(if any)</label>
+            <textarea name="event_details" rows="1" style="width:100%; padding:12px; border:1px solid #407979; border-radius:6px; color:#E7E7E7;background-color:#285151"></textarea>
+        </div>
+		
+		 <!-- Terms & Privacy Consent -->
+<div style="
+    margin:20px 0;
+    padding:15px;
+    background:#013833;
+    border:1px solid #285151;
+    border-radius:8px;
+">
+    <label style="
+        display:flex;
+        align-items:flex-start;
+        gap:10px;
+        font-size:14px;
+        color:#E7E7E7;
+        cursor:pointer;
+        line-height:1.5;
+    ">
+        <input 
+            type="checkbox" 
+            name="terms_privacy_consent" 
+            required
+            style="margin-top:3px;"
+        >
+        <span>
+            I agree to the 
+            <a href="<?php echo site_url('/terms-conditions'); ?>" target="_blank" style="color:#F26A2E; text-decoration:underline;">
+                Terms & Conditions
+            </a> 
+            and 
+            <a href="<?php echo site_url('/privacy-policy'); ?>" target="_blank" style="color:#F26A2E; text-decoration:underline;">
+                Privacy Policy
+            </a>.
+        </span>
+    </label>
+</div>
+
+    </fieldset>
+
+    <!-- Submit Button -->
+    <div style="text-align:center; margin-top:10px;">
+        <button type="submit" name="submit_quotation" class="button alt" style="
+            background:#f26a2e; 
+            color:#fff; 
+            padding:14px 35px; 
+            border:none; 
+            border-radius:6px; 
+            font-size:16px; 
+            font-weight:600;
+            cursor:pointer;
+            transition:0.3s;
+        " onmouseover="this.style.background='#e0551e'" onmouseout="this.style.background='#f26a2e'">
+            Submit Quotation
+        </button>
+    </div>
+</form>
+
+
+
+        <?php
+    }
+
+    return ob_get_clean();
+});
+
+// ===========================================================
+// 3️⃣ Quotation Received Shortcode
+// ===========================================================
+add_shortcode('quotation_received', function() {
+    if ( ! function_exists('wc_get_order') ) return '<p>WooCommerce is not available.</p>';
+
+    ob_start();
+
+    $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
+    if ( ! $order_id ) return '<p>Order not found.</p>';
+
+    $order = wc_get_order($order_id);
+    if ( ! $order ) return '<p>Order not found.</p>';
+	
+		echo '<style>
+		
+			p,td,tr{color:white;
+			font-weight: bold;
+			}
+			h2,h3,h4{
+				color: #F26A2E;
+				font-size: 24px;
+				font-weight: 600;
+				margin-bottom: 20px;
+			}
+			h2{text-align:center;}
+		</style>';
+
+
+    echo '<div class="quotation-success">
+        <h2>Welcome! Your quotation has been submitted successfully.</h2>
+		<hr>
+		<br>
+        <p style="text-align:center;">Your quotation ID is: <strong>' . esc_html($order->get_order_number()) . '</strong></p>
+		<hr>
+		<br>
+    </div>';
+
+    // Display order items
+    echo '<h4 style="color:#F26A2E;">Quotation Summary</h4>';
+    echo '<table border="1" cellpadding="10"><thead>
+        <tr><th>Product</th><th>Quantity</th><th>Price</th><th>Subtotal</th></tr>
+    </thead><tbody>';
+
+    foreach ( $order->get_items() as $item ) {
+        $product = $item->get_product();
+        echo '<tr>
+            <td>' . esc_html($product->get_name()) . '</td>
+            <td>' . esc_html($item->get_quantity()) . '</td>
+            <td>' . wc_price($product->get_price()) . '</td>
+            <td>' . wc_price($product->get_price() * $item->get_quantity()) . '</td>
+        </tr>';
+    }
+
+    echo '</tbody><tfoot>
+        <tr><th colspan="3" style="text-align:right;">Total</th><th>' . $order->get_formatted_order_total() . '</th></tr>
+    </tfoot></table>';
+	
+	
+	// ============================
+// Event Information Table
+// ============================
+echo '<h4 style="color:#F26A2E;">Event Information</h4>';
+echo '<table style="width:100%; border-collapse:collapse;">';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Event Location</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html(get_post_meta($order_id, '_event_location', true)) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Event Date</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html(get_post_meta($order_id, '_event_date', true)) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Event Time</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html(get_post_meta($order_id, '_event_time', true)) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Guest Count</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html(get_post_meta($order_id, '_guest_count', true)) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Event Note</th><td style="padding:8px; border:1px solid #ddd;">' . nl2br(esc_html(get_post_meta($order_id, '_event_details', true))) . '</td></tr>';
+echo '</table>';
+
+
+    // ============================
+// Customer Information Table
+// ============================
+echo '<h4 style="color:#F26A2E;">Customer Information</h4>';
+echo '<table style="width:100%; border-collapse:collapse; margin-bottom:20px;">';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">First Name</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html($order->get_billing_first_name()) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Last Name</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html($order->get_billing_last_name()) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Email</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html($order->get_billing_email()) . '</td></tr>';
+echo '<tr><th style="text-align:left; padding:8px; border:1px solid #ddd;">Phone</th><td style="padding:8px; border:1px solid #ddd;">' . esc_html($order->get_billing_phone()) . '</td></tr>';
+echo '</table>';
+
+
+
+    return ob_get_clean();
+});
+
+
+// ================= End of Quotation Page =======================
+add_action('wp_footer', function(){
+    if(is_cart()): ?>
+        <script>
+        jQuery(document).ready(function($){
+            $('.checkout-button').attr('href','<?php echo site_url("/quotation/"); ?>');
+        });
+        </script>
+    <?php endif;
+});
+
+
+
+add_action( 'woocommerce_admin_order_data_after_billing_address', function($order){
+    echo '<p><strong>Event Location:</strong> ' . get_post_meta($order->get_id(), '_event_location', true) . '</p>';
+    echo '<p><strong>Event Date:</strong> ' . get_post_meta($order->get_id(), '_event_date', true) . '</p>';
+    echo '<p><strong>Event Time:</strong> ' . get_post_meta($order->get_id(), '_event_time', true) . '</p>';
+    echo '<p><strong>Guest Count:</strong> ' . get_post_meta($order->get_id(), '_guest_count', true) . '</p>';
+    echo '<p><strong>Event Details:</strong> ' . get_post_meta($order->get_id(), '_event_details', true) . '</p>';
+});
+
+
+// =======================================================================================================
+// 1️⃣ Register custom order status: Quote Approved
+add_action( 'init', function() {
+    register_post_status( 'wc-quote-approved', array(
+        'label'                     => 'Quote Approved',
+        'public'                    => true,
+        'show_in_admin_status_list' => true,
+        'show_in_admin_all_list'    => true,
+        'exclude_from_search'       => false,
+        'label_count'               => _n_noop(
+            'Quote Approved (%s)',
+            'Quote Approved (%s)'
+        ),
+    ));
+});
+
+// // Add status to WooCommerce dropdown
+// add_filter( 'wc_order_statuses', function( $statuses ) {
+//     $new_statuses = [];
+//     foreach ( $statuses as $key => $label ) {
+//         $new_statuses[ $key ] = $label;
+//         if ( $key === 'wc-pending' ) {
+//             $new_statuses['wc-quote-approved'] = 'Quote Approved';
+//         }
+//     }
+//     return $new_statuses;
+// });
+
+// 2️⃣ Add "Approve Quote" button in admin order page
+add_action( 'woocommerce_admin_order_data_after_order_details', function( $order ) {
+    if ( $order->get_status() !== 'pending' ) return;
+
+    $approve_url = wp_nonce_url(
+        admin_url( 'admin-post.php?action=approve_quote&order_id=' . $order->get_id() ),
+        'approve_quote_' . $order->get_id()
+    );
+
+    echo '<p>
+        <a class="button button-primary" href="' . esc_url( $approve_url ) . '">
+            Approve Quote
+        </a>
+    </p>';
+});
+
+
+
+// ===========================================================
+// Handle Approve Quote & Add Professional Event Info in Invoice Email
+// ===========================================================
+add_action( 'admin_post_approve_quote', function() {
+
+    if ( empty( $_GET['order_id'] ) ) return;
+
+    $order_id = absint( $_GET['order_id'] );
+
+    if ( ! wp_verify_nonce( $_GET['_wpnonce'], 'approve_quote_' . $order_id ) ) {
+        wp_die( 'Security check failed' );
+    }
+
+    $order = wc_get_order( $order_id );
+    if ( ! $order ) return;
+
+    // Step 1: Quote Approved
+    $order->update_status( 'quote-approved', 'Quote approved by admin.' );
+
+    // Step 2: Pending Payment
+    $order->update_status( 'pending-payment', 'Payment requested after quote approval.' );
+
+    // Step 3: Add event info in Customer Invoice email
+    add_action( 'woocommerce_email_after_order_table', function( $order_inner, $sent_to_admin, $plain_text, $email ) use ( $order_id ) {
+        if ( $order_inner->get_id() !== $order_id ) return;
+
+        if ( $email && $email->id === 'customer_invoice' ) {
+            $event_location = esc_html( get_post_meta( $order_id, '_event_location', true ) );
+            $event_date     = esc_html( get_post_meta( $order_id, '_event_date', true ) );
+            $event_time     = esc_html( get_post_meta( $order_id, '_event_time', true ) );
+            $guest_count    = esc_html( get_post_meta( $order_id, '_guest_count', true ) );
+            $event_details  = nl2br( esc_html( get_post_meta( $order_id, '_event_details', true ) ) );
+
+            echo '<h2 style="margin-top:30px; border-bottom:1px solid #eee; padding-bottom:5px;">Event Information</h2>';
+            echo '<table cellpadding="6" cellspacing="0" border="1" style="width:100%; border-collapse:collapse; margin-top:10px;">';
+            echo '<tr><th style="text-align:left; background:#f5f5f5;">Field</th><th style="text-align:left; background:#f5f5f5;">Details</th></tr>';
+            echo '<tr><td>Event Location</td><td>' . $event_location . '</td></tr>';
+            echo '<tr><td>Event Date</td><td>' . $event_date . '</td></tr>';
+            echo '<tr><td>Event Time</td><td>' . $event_time . '</td></tr>';
+            echo '<tr><td>Guest Count</td><td>' . $guest_count . '</td></tr>';
+            echo '<tr><td>Event Details</td><td>' . $event_details . '</td></tr>';
+            echo '</table>';
+        }
+    }, 10, 4 );
+
+    // Step 4: Send Customer Invoice email with correct pay link
+    $mailer = WC()->mailer();
+    $emails = $mailer->get_emails();
+
+    if ( ! empty( $emails['WC_Email_Customer_Invoice'] ) ) {
+        add_filter( 'woocommerce_get_checkout_payment_url', function( $pay_url, $order_inner ) use ( $order_id ) {
+            if ( $order_inner && $order_inner->get_id() === $order_id ) {
+                return wc_get_checkout_url() . 'order-pay/' . $order_inner->get_id() . '/?pay_for_order=true&key=' . $order_inner->get_order_key();
+            }
+            return $pay_url;
+        }, 20, 2 );
+
+        $emails['WC_Email_Customer_Invoice']->trigger( $order_id );
+    }
+
+    wp_safe_redirect( wp_get_referer() );
+    exit;
+
+});
+
+
+// ==================================================
+// Custom Pay-for-Order Login Form Design
+// ==================================================
+add_action('wp_head', 'custom_pay_for_order_login_styles');
+function custom_pay_for_order_login_styles() {
+    if ( isset($_GET['pay_for_order']) && $_GET['pay_for_order'] == 'true' ) {
+        ?>
+        <style>
+        /* --- Header before login form --- */
+        body.woocommerce-checkout .woocommerce-info {
+            text-align: center;
+            font-size: 16px;
+            font-weight: 500;
+            color: #fff;
+            margin-bottom: 25px;
+        }
+		
+
+        /* --- Input fields --- */
+        body.woocommerce-checkout .woocommerce-form-login input.input-text {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            margin-bottom: 18px;
+            font-size: 14px;
+        }
+
+        /* --- Labels --- */
+        body.woocommerce-checkout .woocommerce-form-login label {
+            font-weight: 600;
+            margin-bottom: 6px;
+            display: block;
+            color: #fff;
+        }
+
+        /* --- Button --- */
+        body.woocommerce-checkout .woocommerce-form-login .button {
+            background-color: #007cba;
+            color: #fff;
+            border-radius: 6px;
+            padding: 14px;
+            font-size: 16px;
+            width: 100%;
+            border: none;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+
+        body.woocommerce-checkout .woocommerce-form-login .button:hover {
+            background-color: #005f8d;
+        }
+
+        /* --- Links (Lost password, Remember me) --- */
+        body.woocommerce-checkout .woocommerce-form-login a {
+            color: #007cba;
+            font-size: 14px;
+        }
+
+        body.woocommerce-checkout .woocommerce-form-login a:hover {
+            text-decoration: underline;
+        }
+
+        /* --- Remember me checkbox alignment --- */
+        body.woocommerce-checkout .woocommerce-form__label-for-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 14px;
+        }
+		body.woocommerce-checkout .woocommerce-info::before {
+			content: none;
+		}
+
+        </style>
+        <?php
+    }
+}
